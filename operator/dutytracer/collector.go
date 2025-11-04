@@ -615,7 +615,26 @@ func (c *Collector) collect(ctx context.Context, msg *queue.SSVMessage, verifySi
 					trace.syncCommitteeRoot = syncRoot
 					trace.attestationRoot = attRoot
 					trace.roleRootsReady = true
+
+					// Log before flush to see what's in pending
+					pendingCount := 0
+					for _, perSigner := range trace.pendingByRoot {
+						for _, byTs := range perSigner {
+							for _, idxs := range byTs {
+								pendingCount += len(idxs)
+							}
+						}
+					}
+
 					trace.flushPending()
+
+					c.logger.Info("flushed pending signatures to role buckets",
+						fields.Slot(slot),
+						fields.CommitteeID(committeeID),
+						zap.Int("pending_count_before_flush", pendingCount),
+						zap.Int("attester_signers_after_flush", len(trace.Attester)),
+						zap.Int("sync_committee_signers_after_flush", len(trace.SyncCommittee)))
+
 					// Check quorum for all validators after flushing pending signatures.
 					// This ensures quorum detection happens immediately when signatures that
 					// arrived before the proposal are reclassified into role buckets.
@@ -1090,11 +1109,17 @@ func (c *Collector) signersToKey(signers []spectypes.OperatorID) string {
 // IMPORTANT: trace must be locked by the caller before calling this function.
 func (c *Collector) checkQuorumAfterFlush(logger *zap.Logger, committeeID spectypes.CommitteeID, slot phase0.Slot, trace *committeeDutyTrace) {
 	if c.decidedListenerFunc == nil {
+		logger.Debug("skipping quorum check after flush: decidedListenerFunc is nil",
+			fields.Slot(slot),
+			fields.CommitteeID(committeeID))
 		return
 	}
 
 	committee, found := c.validators.Committee(committeeID)
 	if !found || len(committee.Operators) == 0 {
+		logger.Warn("skipping quorum check after flush: committee not found or has no operators",
+			fields.Slot(slot),
+			fields.CommitteeID(committeeID))
 		return
 	}
 
@@ -1111,9 +1136,20 @@ func (c *Collector) checkQuorumAfterFlush(logger *zap.Logger, committeeID specty
 			attesterValidators[idx] = struct{}{}
 		}
 	}
+
+	logger.Debug("checking quorum after flush",
+		fields.Slot(slot),
+		fields.CommitteeID(committeeID),
+		zap.Int("attester_validators", len(attesterValidators)),
+		zap.Int("attester_signers", len(trace.Attester)),
+		zap.Uint64("threshold", threshold))
 	for validatorIndex := range attesterValidators {
 		_, exists := c.validators.ValidatorByIndex(validatorIndex)
 		if !exists {
+			logger.Warn("skipping attester quorum check: validator not found in validator store",
+				fields.Slot(slot),
+				fields.ValidatorIndex(validatorIndex),
+				fields.CommitteeID(committeeID))
 			continue
 		}
 		if trace.publishedQuorums[validatorIndex] == nil {
